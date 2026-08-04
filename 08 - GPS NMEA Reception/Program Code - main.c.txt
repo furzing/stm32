@@ -1,0 +1,590 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+/**
+  * @brief Interrupt-driven state for one raw NMEA receiver.
+  *
+  * The interrupt builds a sentence one byte at a time. When a newline arrives,
+  * it copies the completed sentence into a second buffer for the main loop.
+  * Keeping UART transmission out of the interrupt makes the interrupt short.
+  */
+typedef struct
+{
+  uint8_t received_byte;
+  char building_line[128];
+  char ready_line[128];
+  volatile uint16_t building_length;
+  volatile uint16_t ready_length;
+  volatile uint32_t total_bytes;
+  volatile uint32_t completed_lines;
+  volatile uint32_t dropped_lines;
+  volatile uint32_t overflow_lines;
+  volatile uint32_t uart_errors;
+  volatile uint32_t last_byte_ms;
+  volatile uint8_t collecting;
+  volatile uint8_t line_ready;
+} GPS_Receiver;
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/* GPS 08A raw-NMEA receiver configuration. */
+#define GPS_NMEA_LINE_SIZE       128U
+#define GPS_STATUS_PERIOD_MS    5000U
+#define GPS_LED_PERIOD_MS        500U
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+
+static GPS_Receiver gps_receiver;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART1_UART_Init(void);
+/* USER CODE BEGIN PFP */
+static HAL_StatusTypeDef UART_SendString(const char *text);
+static HAL_StatusTypeDef GPS_StartReception(void);
+static uint8_t GPS_TakeCompletedLine(char *destination,
+                                     uint16_t destination_size);
+static void GPS_PrintStatus(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+/**
+  * @brief Send a null-terminated text string through the Nucleo's USB serial port.
+  *
+  * USART2 is physically connected to the onboard ST-LINK Virtual COM Port:
+  * PA2 is transmit (TX), and PA3 is receive (RX).
+  */
+static HAL_StatusTypeDef UART_SendString(const char *text)
+{
+  if (text == NULL)
+  {
+    return HAL_ERROR;
+  }
+
+  return HAL_UART_Transmit(&huart2,
+                           (uint8_t *)text,
+                           (uint16_t)strlen(text),
+                           100U);
+}
+
+/**
+  * @brief Clear the GPS state and arm the first one-byte USART1 reception.
+  *
+  * HAL_UART_Receive_IT() returns immediately. USART1 later interrupts the CPU
+  * after one byte arrives, and HAL calls HAL_UART_RxCpltCallback().
+  */
+static HAL_StatusTypeDef GPS_StartReception(void)
+{
+  memset(&gps_receiver, 0, sizeof(gps_receiver));
+
+  return HAL_UART_Receive_IT(&huart1,
+                             &gps_receiver.received_byte,
+                             1U);
+}
+
+/**
+  * @brief Copy one completed NMEA sentence safely from interrupt to main.
+  *
+  * The interrupt could finish another sentence while main is copying. A very
+  * short critical section prevents the shared ready buffer from changing
+  * halfway through the copy. The previous interrupt state is restored so this
+  * function does not accidentally enable interrupts disabled by its caller.
+  */
+static uint8_t GPS_TakeCompletedLine(char *destination,
+                                     uint16_t destination_size)
+{
+  uint8_t result = 0U;
+
+  if ((destination == NULL) || (destination_size == 0U))
+  {
+    return 0U;
+  }
+
+  uint32_t previous_interrupt_mask = __get_PRIMASK();
+  __disable_irq();
+
+  if (gps_receiver.line_ready != 0U)
+  {
+    uint16_t length = gps_receiver.ready_length;
+
+    if (length >= destination_size)
+    {
+      length = (uint16_t)(destination_size - 1U);
+    }
+
+    memcpy(destination, gps_receiver.ready_line, length);
+    destination[length] = '\0';
+    gps_receiver.line_ready = 0U;
+    result = 1U;
+  }
+
+  if (previous_interrupt_mask == 0U)
+  {
+    __enable_irq();
+  }
+
+  return result;
+}
+
+/**
+  * @brief Print receiver health counters without interpreting navigation data.
+  */
+static void GPS_PrintStatus(void)
+{
+  char message[176];
+  uint32_t bytes;
+  uint32_t lines;
+  uint32_t dropped;
+  uint32_t overflows;
+  uint32_t errors;
+  uint32_t last_byte_ms;
+
+  uint32_t previous_interrupt_mask = __get_PRIMASK();
+  __disable_irq();
+  bytes = gps_receiver.total_bytes;
+  lines = gps_receiver.completed_lines;
+  dropped = gps_receiver.dropped_lines;
+  overflows = gps_receiver.overflow_lines;
+  errors = gps_receiver.uart_errors;
+  last_byte_ms = gps_receiver.last_byte_ms;
+  if (previous_interrupt_mask == 0U)
+  {
+    __enable_irq();
+  }
+
+  if (bytes == 0U)
+  {
+    UART_SendString(
+        "GPS STATUS: no UART bytes; check power, GND, and GPS TX -> PA10/D2.\r\n");
+    return;
+  }
+
+  snprintf(message,
+           sizeof(message),
+           "GPS STATUS: bytes=%lu lines=%lu dropped=%lu overflow=%lu errors=%lu last_byte=%lu ms ago\r\n",
+           (unsigned long)bytes,
+           (unsigned long)lines,
+           (unsigned long)dropped,
+           (unsigned long)overflows,
+           (unsigned long)errors,
+           (unsigned long)(HAL_GetTick() - last_byte_ms));
+  UART_SendString(message);
+}
+
+/**
+  * @brief USART receive-complete callback called by the STM32 HAL.
+  *
+  * NMEA is ASCII text. '$' starts a sentence, carriage return is ignored, and
+  * newline completes it. Bytes before '$' are discarded so startup can begin
+  * in the middle of a GPS transmission and still synchronize automatically.
+  */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if ((huart == NULL) || (huart->Instance != USART1))
+  {
+    return;
+  }
+
+  uint8_t byte = gps_receiver.received_byte;
+  gps_receiver.total_bytes++;
+  gps_receiver.last_byte_ms = HAL_GetTick();
+
+  if (byte == (uint8_t)'$')
+  {
+    gps_receiver.building_length = 0U;
+    gps_receiver.collecting = 1U;
+    gps_receiver.building_line[gps_receiver.building_length++] = '$';
+  }
+  else if (gps_receiver.collecting != 0U)
+  {
+    if (byte == (uint8_t)'\n')
+    {
+      if (gps_receiver.line_ready == 0U)
+      {
+        uint16_t length = gps_receiver.building_length;
+        memcpy(gps_receiver.ready_line,
+               gps_receiver.building_line,
+               length);
+        gps_receiver.ready_line[length] = '\0';
+        gps_receiver.ready_length = length;
+        gps_receiver.line_ready = 1U;
+        gps_receiver.completed_lines++;
+      }
+      else
+      {
+        /*
+         * Main has not consumed the previous sentence. Preserve the older
+         * complete sentence and count this one instead of overwriting data.
+         */
+        gps_receiver.dropped_lines++;
+      }
+
+      gps_receiver.building_length = 0U;
+      gps_receiver.collecting = 0U;
+    }
+    else if (byte != (uint8_t)'\r')
+    {
+      if (gps_receiver.building_length < (GPS_NMEA_LINE_SIZE - 1U))
+      {
+        gps_receiver.building_line[gps_receiver.building_length++] =
+            (char)byte;
+      }
+      else
+      {
+        gps_receiver.overflow_lines++;
+        gps_receiver.building_length = 0U;
+        gps_receiver.collecting = 0U;
+      }
+    }
+  }
+
+  if (HAL_UART_Receive_IT(&huart1,
+                          &gps_receiver.received_byte,
+                          1U) != HAL_OK)
+  {
+    gps_receiver.uart_errors++;
+  }
+}
+
+/**
+  * @brief Recover reception after framing, noise, or overrun errors.
+  */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if ((huart == NULL) || (huart->Instance != USART1))
+  {
+    return;
+  }
+
+  gps_receiver.uart_errors++;
+  gps_receiver.building_length = 0U;
+  gps_receiver.collecting = 0U;
+
+  if (HAL_UART_Receive_IT(&huart1,
+                          &gps_receiver.received_byte,
+                          1U) != HAL_OK)
+  {
+    gps_receiver.uart_errors++;
+  }
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_USART1_UART_Init();
+  /* USER CODE BEGIN 2 */
+  UART_SendString("\r\n========================================\r\n");
+  UART_SendString("08A - GPS raw NMEA reception\r\n");
+  UART_SendString("GPS USART1: PA10/RX, PA9/TX, 9600 baud, 8-N-1\r\n");
+  UART_SendString("Console USART2: ST-LINK VCP, 38400 baud, 8-N-1\r\n");
+  UART_SendString("LD2 heartbeat: toggles every 500 ms\r\n");
+
+  if (GPS_StartReception() == HAL_OK)
+  {
+    UART_SendString(
+        "USART1 interrupt reception armed; waiting for '$' NMEA sentences.\r\n");
+  }
+  else
+  {
+    UART_SendString(
+        "ERROR: USART1 reception could not be started.\r\n");
+  }
+  UART_SendString("========================================\r\n");
+
+  char gps_line[GPS_NMEA_LINE_SIZE] = {0};
+  uint32_t last_led_toggle = HAL_GetTick();
+  uint32_t last_gps_status = HAL_GetTick();
+
+  
+/* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    uint32_t now = HAL_GetTick();
+
+    if ((uint32_t)(now - last_led_toggle) >= GPS_LED_PERIOD_MS)
+    {
+      HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+      last_led_toggle = now;
+    }
+
+    if (GPS_TakeCompletedLine(gps_line, sizeof(gps_line)) != 0U)
+    {
+      UART_SendString("GPS RAW: ");
+      UART_SendString(gps_line);
+      UART_SendString("\r\n");
+    }
+
+    if ((uint32_t)(now - last_gps_status) >= GPS_STATUS_PERIOD_MS)
+    {
+      GPS_PrintStatus();
+      last_gps_status = now;
+    }
+
+    HAL_Delay(1U);
+  }
+  
+/* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1;
+  PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK1;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 9600;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 38400;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PA5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB8 PB9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

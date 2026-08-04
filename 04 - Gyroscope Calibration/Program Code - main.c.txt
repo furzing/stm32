@@ -1,0 +1,981 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+/**
+  * @brief One simultaneous accelerometer, gyroscope, and temperature sample.
+  *
+  * Each sensor output is a signed 16-bit two's-complement number. Keeping the
+  * raw values here makes the hardware-facing layer easy to verify and allows
+  * the conversion scale to be changed independently later.
+  */
+typedef struct
+{
+  int16_t accel_x;
+  int16_t accel_y;
+  int16_t accel_z;
+  int16_t gyro_x;
+  int16_t gyro_y;
+  int16_t gyro_z;
+  int16_t temperature;
+} ICM20948_RawData;
+
+/**
+  * @brief Stationary gyroscope offsets measured during startup.
+  */
+typedef struct
+{
+  int32_t bias_x_raw;
+  int32_t bias_y_raw;
+  int32_t bias_z_raw;
+} ICM20948_GyroCalibration;
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define ICM20948_ADDRESS_LOW       0x68U
+#define ICM20948_ADDRESS_HIGH      0x69U
+#define ICM20948_REG_BANK_SEL      0x7FU
+#define ICM20948_REG_WHO_AM_I      0x00U
+#define ICM20948_WHO_AM_I_VALUE    0xEAU
+
+#define ICM20948_BANK_0             0U
+#define ICM20948_BANK_2             2U
+
+/* User bank 0 registers. */
+#define ICM20948_REG_PWR_MGMT_1     0x06U
+#define ICM20948_REG_PWR_MGMT_2     0x07U
+#define ICM20948_REG_ACCEL_XOUT_H   0x2DU
+
+/* User bank 2 registers. */
+#define ICM20948_REG_GYRO_SMPLRT_DIV    0x00U
+#define ICM20948_REG_GYRO_CONFIG_1      0x01U
+#define ICM20948_REG_ACCEL_SMPLRT_DIV_1 0x10U
+#define ICM20948_REG_ACCEL_SMPLRT_DIV_2 0x11U
+#define ICM20948_REG_ACCEL_CONFIG       0x14U
+
+/* Configuration used during this first motion-data test. */
+#define ICM20948_DEVICE_RESET        0x80U
+#define ICM20948_CLOCK_AUTO          0x01U
+#define ICM20948_ALL_AXES_ENABLED    0x00U
+#define ICM20948_SAMPLE_RATE_DIVIDER 10U
+#define ICM20948_DLPF_CONFIG_3       (3U << 3)
+#define ICM20948_DLPF_ENABLE         0x01U
+#define ICM20948_ACCEL_2G            (0U << 1)
+#define ICM20948_GYRO_250DPS         (0U << 1)
+
+/* Scale factors for the selected +/-2 g and +/-250 dps ranges. */
+#define ICM20948_ACCEL_LSB_PER_G      16384L
+#define ICM20948_GYRO_LSB_PER_DPS       131L
+#define ICM20948_MOTION_DATA_LENGTH       14U
+#define ICM20948_OUTPUT_PERIOD_MS         200U
+#define ICM20948_GYRO_CALIBRATION_SAMPLES 500U
+#define ICM20948_GYRO_CALIBRATION_DELAY_MS 10U
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_USART2_UART_Init(void);
+/* USER CODE BEGIN PFP */
+static HAL_StatusTypeDef UART_SendString(const char *text);
+static uint8_t I2C_Scan(void);
+static HAL_StatusTypeDef ICM20948_SelectBank(uint8_t address, uint8_t bank);
+static HAL_StatusTypeDef ICM20948_WriteRegister(uint8_t address,
+                                                uint8_t bank,
+                                                uint8_t reg,
+                                                uint8_t value);
+static HAL_StatusTypeDef ICM20948_ReadRegisters(uint8_t address,
+                                                uint8_t bank,
+                                                uint8_t first_reg,
+                                                uint8_t *data,
+                                                uint16_t length);
+static uint8_t ICM20948_CheckIdentity(uint8_t address);
+static HAL_StatusTypeDef ICM20948_Initialize(uint8_t address);
+static HAL_StatusTypeDef ICM20948_ReadRawData(uint8_t address,
+                                              ICM20948_RawData *sample);
+static HAL_StatusTypeDef ICM20948_CalibrateGyroscope(
+    uint8_t address,
+    ICM20948_GyroCalibration *calibration);
+static void FormatMilliValue(char *text, size_t text_size, int32_t value);
+static void ICM20948_PrintSample(
+    const ICM20948_RawData *sample,
+    const ICM20948_GyroCalibration *calibration);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+/**
+  * @brief Send a null-terminated text string through the Nucleo's USB serial port.
+  *
+  * USART2 is physically connected to the onboard ST-LINK Virtual COM Port:
+  * PA2 is transmit (TX), and PA3 is receive (RX).
+  */
+static HAL_StatusTypeDef UART_SendString(const char *text)
+{
+  if (text == NULL)
+  {
+    return HAL_ERROR;
+  }
+
+  return HAL_UART_Transmit(&huart2,
+                           (uint8_t *)text,
+                           (uint16_t)strlen(text),
+                           100U);
+}
+
+/**
+  * @brief Scan the usable 7-bit I2C address range and print every response.
+  *
+  * STM32 HAL expects the 7-bit device address shifted left by one bit.
+  * The ICM-20948 normally responds at 0x68 or 0x69, depending on AD0.
+  */
+static uint8_t I2C_Scan(void)
+{
+  char message[80];
+  uint8_t devices_found = 0U;
+  uint8_t icm20948_address = 0U;
+
+  UART_SendString("\r\nScanning the I2C bus...\r\n");
+
+  /* 0x08 through 0x77 excludes reserved I2C addresses. */
+  for (uint8_t address = 0x08U; address <= 0x77U; address++)
+  {
+    HAL_StatusTypeDef status = HAL_I2C_IsDeviceReady(
+        &hi2c1,
+        (uint16_t)(address << 1),
+        2U,
+        10U);
+
+    if (status == HAL_OK)
+    {
+      devices_found++;
+
+      if ((address == ICM20948_ADDRESS_LOW) ||
+          (address == ICM20948_ADDRESS_HIGH))
+      {
+        icm20948_address = address;
+
+        snprintf(message,
+                 sizeof(message),
+                 "  Found 0x%02X - possible ICM-20948\r\n",
+                 address);
+      }
+      else
+      {
+        snprintf(message,
+                 sizeof(message),
+                 "  Found 0x%02X\r\n",
+                 address);
+      }
+
+      UART_SendString(message);
+    }
+  }
+
+  if (devices_found == 0U)
+  {
+    UART_SendString("  No I2C devices responded.\r\n");
+  }
+  else
+  {
+    snprintf(message,
+             sizeof(message),
+             "Scan complete: %u device(s) found.\r\n",
+             devices_found);
+    UART_SendString(message);
+  }
+
+  return icm20948_address;
+}
+
+/**
+  * @brief Select one of the ICM-20948's four user register banks.
+  */
+static HAL_StatusTypeDef ICM20948_SelectBank(uint8_t address, uint8_t bank)
+{
+  uint8_t bank_value = (uint8_t)((bank & 0x03U) << 4);
+
+  return HAL_I2C_Mem_Write(&hi2c1,
+                           (uint16_t)(address << 1),
+                           ICM20948_REG_BANK_SEL,
+                           I2C_MEMADD_SIZE_8BIT,
+                           &bank_value,
+                           1U,
+                           100U);
+}
+
+/**
+  * @brief Write one register after selecting the register's user bank.
+  */
+static HAL_StatusTypeDef ICM20948_WriteRegister(uint8_t address,
+                                                uint8_t bank,
+                                                uint8_t reg,
+                                                uint8_t value)
+{
+  HAL_StatusTypeDef status = ICM20948_SelectBank(address, bank);
+
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  return HAL_I2C_Mem_Write(&hi2c1,
+                           (uint16_t)(address << 1),
+                           reg,
+                           I2C_MEMADD_SIZE_8BIT,
+                           &value,
+                           1U,
+                           100U);
+}
+
+/**
+  * @brief Read consecutive registers after selecting the requested user bank.
+  */
+static HAL_StatusTypeDef ICM20948_ReadRegisters(uint8_t address,
+                                                uint8_t bank,
+                                                uint8_t first_reg,
+                                                uint8_t *data,
+                                                uint16_t length)
+{
+  if ((data == NULL) || (length == 0U))
+  {
+    return HAL_ERROR;
+  }
+
+  HAL_StatusTypeDef status = ICM20948_SelectBank(address, bank);
+
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  return HAL_I2C_Mem_Read(&hi2c1,
+                          (uint16_t)(address << 1),
+                          first_reg,
+                          I2C_MEMADD_SIZE_8BIT,
+                          data,
+                          length,
+                          100U);
+}
+
+/**
+  * @brief Read WHO_AM_I and confirm that the responding device is an ICM-20948.
+  *
+  * The sensor has four register banks. REG_BANK_SEL is available from every
+  * bank, so writing zero selects bank 0 before reading WHO_AM_I.
+  *
+  * @param address Sensor's 7-bit I2C address (0x68 or 0x69).
+  */
+static uint8_t ICM20948_CheckIdentity(uint8_t address)
+{
+  char message[96];
+  uint8_t who_am_i = 0x00U;
+
+  HAL_StatusTypeDef status = ICM20948_ReadRegisters(
+      address,
+      ICM20948_BANK_0,
+      ICM20948_REG_WHO_AM_I,
+      &who_am_i,
+      1U);
+
+  if (status != HAL_OK)
+  {
+    UART_SendString("ICM-20948 identity read failed.\r\n");
+    return 0U;
+  }
+
+  snprintf(message,
+           sizeof(message),
+           "WHO_AM_I at 0x%02X returned 0x%02X (expected 0x%02X).\r\n",
+           address,
+           who_am_i,
+           ICM20948_WHO_AM_I_VALUE);
+  UART_SendString(message);
+
+  if (who_am_i == ICM20948_WHO_AM_I_VALUE)
+  {
+    UART_SendString("Identity confirmed: this is an ICM-20948.\r\n");
+    return 1U;
+  }
+
+  UART_SendString("Device responded, but its identity is not ICM-20948.\r\n");
+  return 0U;
+}
+
+/**
+  * @brief Reset, wake, and configure the accelerometer and gyroscope.
+  *
+  * Initial bring-up settings:
+  * - accelerometer: +/-2 g, DLPF enabled, approximately 102 Hz sample rate
+  * - gyroscope:     +/-250 dps, DLPF enabled, approximately 102 Hz sample rate
+  *
+  * The narrow ranges maximize sensitivity while the sensor is being moved by
+  * hand. CubeSat dynamics may later require wider ranges.
+  */
+static HAL_StatusTypeDef ICM20948_Initialize(uint8_t address)
+{
+  HAL_StatusTypeDef status;
+
+  status = ICM20948_WriteRegister(address,
+                                  ICM20948_BANK_0,
+                                  ICM20948_REG_PWR_MGMT_1,
+                                  ICM20948_DEVICE_RESET);
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  /* The reset bit clears automatically. Allow the device to restart fully. */
+  HAL_Delay(100U);
+
+  status = ICM20948_WriteRegister(address,
+                                  ICM20948_BANK_0,
+                                  ICM20948_REG_PWR_MGMT_1,
+                                  ICM20948_CLOCK_AUTO);
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  /* Datasheet gyro start-up time from full-chip sleep is up to 35 ms. */
+  HAL_Delay(35U);
+
+  status = ICM20948_WriteRegister(address,
+                                  ICM20948_BANK_0,
+                                  ICM20948_REG_PWR_MGMT_2,
+                                  ICM20948_ALL_AXES_ENABLED);
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  status = ICM20948_WriteRegister(address,
+                                  ICM20948_BANK_2,
+                                  ICM20948_REG_GYRO_SMPLRT_DIV,
+                                  ICM20948_SAMPLE_RATE_DIVIDER);
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  status = ICM20948_WriteRegister(
+      address,
+      ICM20948_BANK_2,
+      ICM20948_REG_GYRO_CONFIG_1,
+      (uint8_t)(ICM20948_DLPF_CONFIG_3 |
+                ICM20948_GYRO_250DPS |
+                ICM20948_DLPF_ENABLE));
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  /* Accelerometer divider is 12 bits: upper four bits, then lower eight. */
+  status = ICM20948_WriteRegister(address,
+                                  ICM20948_BANK_2,
+                                  ICM20948_REG_ACCEL_SMPLRT_DIV_1,
+                                  0x00U);
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  status = ICM20948_WriteRegister(address,
+                                  ICM20948_BANK_2,
+                                  ICM20948_REG_ACCEL_SMPLRT_DIV_2,
+                                  ICM20948_SAMPLE_RATE_DIVIDER);
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  status = ICM20948_WriteRegister(
+      address,
+      ICM20948_BANK_2,
+      ICM20948_REG_ACCEL_CONFIG,
+      (uint8_t)(ICM20948_DLPF_CONFIG_3 |
+                ICM20948_ACCEL_2G |
+                ICM20948_DLPF_ENABLE));
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  return ICM20948_SelectBank(address, ICM20948_BANK_0);
+}
+
+/**
+  * @brief Read all six motion axes and temperature in one I2C transaction.
+  *
+  * A burst read keeps every axis from the same sampling instant. Register
+  * values arrive big-endian: high byte first, followed by low byte.
+  */
+static HAL_StatusTypeDef ICM20948_ReadRawData(uint8_t address,
+                                              ICM20948_RawData *sample)
+{
+  uint8_t bytes[ICM20948_MOTION_DATA_LENGTH];
+
+  if (sample == NULL)
+  {
+    return HAL_ERROR;
+  }
+
+  HAL_StatusTypeDef status = ICM20948_ReadRegisters(
+      address,
+      ICM20948_BANK_0,
+      ICM20948_REG_ACCEL_XOUT_H,
+      bytes,
+      sizeof(bytes));
+
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  sample->accel_x = (int16_t)(((uint16_t)bytes[0] << 8) | bytes[1]);
+  sample->accel_y = (int16_t)(((uint16_t)bytes[2] << 8) | bytes[3]);
+  sample->accel_z = (int16_t)(((uint16_t)bytes[4] << 8) | bytes[5]);
+  sample->gyro_x = (int16_t)(((uint16_t)bytes[6] << 8) | bytes[7]);
+  sample->gyro_y = (int16_t)(((uint16_t)bytes[8] << 8) | bytes[9]);
+  sample->gyro_z = (int16_t)(((uint16_t)bytes[10] << 8) | bytes[11]);
+  sample->temperature = (int16_t)(((uint16_t)bytes[12] << 8) | bytes[13]);
+
+  return HAL_OK;
+}
+
+/**
+  * @brief Measure the stationary zero-rate error of each gyroscope axis.
+  *
+  * MEMS gyroscopes rarely output exactly zero when motionless. Averaging many
+  * stationary samples estimates this bias. It is then subtracted from all
+  * future measurements before conversion to degrees per second.
+  *
+  * @note The sensor must remain completely still throughout this function.
+  */
+static HAL_StatusTypeDef ICM20948_CalibrateGyroscope(
+    uint8_t address,
+    ICM20948_GyroCalibration *calibration)
+{
+  ICM20948_RawData sample;
+  int64_t sum_x = 0;
+  int64_t sum_y = 0;
+  int64_t sum_z = 0;
+
+  if (calibration == NULL)
+  {
+    return HAL_ERROR;
+  }
+
+  UART_SendString("\r\nGyroscope calibration starting.\r\n");
+  UART_SendString("KEEP THE SENSOR COMPLETELY STILL FOR 5 SECONDS...\r\n");
+
+  /*
+   * Allow time to release the RESET button or stop touching the assembly
+   * before samples begin contributing to the average.
+   */
+  HAL_Delay(1000U);
+
+  for (uint16_t index = 0U;
+       index < ICM20948_GYRO_CALIBRATION_SAMPLES;
+       index++)
+  {
+    if (ICM20948_ReadRawData(address, &sample) != HAL_OK)
+    {
+      UART_SendString("Calibration interrupted by an I2C read failure.\r\n");
+      return HAL_ERROR;
+    }
+
+    sum_x += sample.gyro_x;
+    sum_y += sample.gyro_y;
+    sum_z += sample.gyro_z;
+
+    HAL_Delay(ICM20948_GYRO_CALIBRATION_DELAY_MS);
+  }
+
+  calibration->bias_x_raw =
+      (int32_t)(sum_x / ICM20948_GYRO_CALIBRATION_SAMPLES);
+  calibration->bias_y_raw =
+      (int32_t)(sum_y / ICM20948_GYRO_CALIBRATION_SAMPLES);
+  calibration->bias_z_raw =
+      (int32_t)(sum_z / ICM20948_GYRO_CALIBRATION_SAMPLES);
+
+  char bias_x[16], bias_y[16], bias_z[16];
+  char message[112];
+
+  FormatMilliValue(
+      bias_x,
+      sizeof(bias_x),
+      (calibration->bias_x_raw * 1000L) / ICM20948_GYRO_LSB_PER_DPS);
+  FormatMilliValue(
+      bias_y,
+      sizeof(bias_y),
+      (calibration->bias_y_raw * 1000L) / ICM20948_GYRO_LSB_PER_DPS);
+  FormatMilliValue(
+      bias_z,
+      sizeof(bias_z),
+      (calibration->bias_z_raw * 1000L) / ICM20948_GYRO_LSB_PER_DPS);
+
+  snprintf(message,
+           sizeof(message),
+           "Gyro bias [dps]: X=%s Y=%s Z=%s\r\n",
+           bias_x,
+           bias_y,
+           bias_z);
+  UART_SendString(message);
+  UART_SendString("Gyroscope calibration complete.\r\n\r\n");
+
+  return HAL_OK;
+}
+
+/**
+  * @brief Format a value stored in thousandths without float printf support.
+  *
+  * For example, value=-1234 becomes "-1.234".
+  */
+static void FormatMilliValue(char *text, size_t text_size, int32_t value)
+{
+  char sign = '+';
+  uint32_t magnitude;
+
+  if ((text == NULL) || (text_size == 0U))
+  {
+    return;
+  }
+
+  if (value < 0)
+  {
+    sign = '-';
+    magnitude = (uint32_t)(-(int64_t)value);
+  }
+  else
+  {
+    magnitude = (uint32_t)value;
+  }
+
+  snprintf(text,
+           text_size,
+           "%c%lu.%03lu",
+           sign,
+           (unsigned long)(magnitude / 1000U),
+           (unsigned long)(magnitude % 1000U));
+}
+
+/**
+  * @brief Convert one raw sample to engineering units and print it.
+  */
+static void ICM20948_PrintSample(
+    const ICM20948_RawData *sample,
+    const ICM20948_GyroCalibration *calibration)
+{
+  char ax[16], ay[16], az[16];
+  char gx[16], gy[16], gz[16];
+  char temperature[16];
+  char message[180];
+
+  if ((sample == NULL) || (calibration == NULL))
+  {
+    return;
+  }
+
+  /* milli-g = raw * 1000 / 16384 for the selected +/-2 g range. */
+  FormatMilliValue(ax, sizeof(ax),
+                   ((int32_t)sample->accel_x * 1000L) /
+                   ICM20948_ACCEL_LSB_PER_G);
+  FormatMilliValue(ay, sizeof(ay),
+                   ((int32_t)sample->accel_y * 1000L) /
+                   ICM20948_ACCEL_LSB_PER_G);
+  FormatMilliValue(az, sizeof(az),
+                   ((int32_t)sample->accel_z * 1000L) /
+                   ICM20948_ACCEL_LSB_PER_G);
+
+  /* milli-dps = raw * 1000 / 131 for the selected +/-250 dps range. */
+  FormatMilliValue(gx, sizeof(gx),
+                   (((int32_t)sample->gyro_x -
+                     calibration->bias_x_raw) * 1000L) /
+                   ICM20948_GYRO_LSB_PER_DPS);
+  FormatMilliValue(gy, sizeof(gy),
+                   (((int32_t)sample->gyro_y -
+                     calibration->bias_y_raw) * 1000L) /
+                   ICM20948_GYRO_LSB_PER_DPS);
+  FormatMilliValue(gz, sizeof(gz),
+                   (((int32_t)sample->gyro_z -
+                     calibration->bias_z_raw) * 1000L) /
+                   ICM20948_GYRO_LSB_PER_DPS);
+
+  /*
+   * Temperature formula from the datasheet:
+   * temperature_degC = raw / 333.87 + 21.
+   * This integer calculation keeps three decimal places.
+   */
+  int32_t temperature_milli_c = (int32_t)(
+      21000LL + (((int64_t)sample->temperature * 100000LL) / 33387LL));
+  FormatMilliValue(temperature,
+                   sizeof(temperature),
+                   temperature_milli_c);
+
+  snprintf(message,
+           sizeof(message),
+           "ACC[g] X=%s Y=%s Z=%s | GYRO[dps] X=%s Y=%s Z=%s | TEMP[C]=%s\r\n",
+           ax, ay, az, gx, gy, gz, temperature);
+  UART_SendString(message);
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_USART2_UART_Init();
+  /* USER CODE BEGIN 2 */
+  UART_SendString("\r\n========================================\r\n");
+  UART_SendString("NUCLEO-F334R8 sensor bring-up\r\n");
+  UART_SendString("USART2: 38400 baud, 8 data bits, no parity, 1 stop bit\r\n");
+  UART_SendString("LD2 heartbeat: toggles every 500 ms\r\n");
+
+  /*
+   * The ICM-20948 datasheet allows up to 100 ms before register access
+   * after power-up. Waiting here avoids scanning it too early.
+  */
+  HAL_Delay(100U);
+  uint8_t icm20948_address = I2C_Scan();
+  uint8_t icm20948_ready = 0U;
+  ICM20948_GyroCalibration gyro_calibration = {0};
+
+  if ((icm20948_address != 0U) &&
+      (ICM20948_CheckIdentity(icm20948_address) != 0U))
+  {
+    if (ICM20948_Initialize(icm20948_address) == HAL_OK)
+    {
+      UART_SendString("Accelerometer and gyroscope initialized.\r\n");
+
+      if (ICM20948_CalibrateGyroscope(
+              icm20948_address,
+              &gyro_calibration) == HAL_OK)
+      {
+        icm20948_ready = 1U;
+        UART_SendString("Streaming one calibrated sample every 200 ms...\r\n");
+      }
+      else
+      {
+        UART_SendString("Gyroscope calibration failed.\r\n");
+      }
+    }
+    else
+    {
+      UART_SendString("ICM-20948 initialization failed.\r\n");
+    }
+  }
+
+  UART_SendString("========================================\r\n");
+
+  ICM20948_RawData motion_sample = {0};
+  uint32_t last_led_toggle = HAL_GetTick();
+  uint32_t last_motion_output = HAL_GetTick();
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    uint32_t now = HAL_GetTick();
+
+    /*
+     * PA5 drives the Nucleo user LED (LD2). A visible heartbeat proves
+     * that initialization completed and the main loop is still running.
+     */
+    if ((uint32_t)(now - last_led_toggle) >= 500U)
+    {
+      HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+      last_led_toggle = now;
+    }
+
+    if ((icm20948_ready != 0U) &&
+        ((uint32_t)(now - last_motion_output) >=
+         ICM20948_OUTPUT_PERIOD_MS))
+    {
+      if (ICM20948_ReadRawData(icm20948_address,
+                               &motion_sample) == HAL_OK)
+      {
+        ICM20948_PrintSample(&motion_sample, &gyro_calibration);
+      }
+      else
+      {
+        UART_SendString("Motion data read failed; check the I2C wiring.\r\n");
+      }
+
+      last_motion_output = now;
+    }
+
+    /* Yield briefly so this polling loop does not spin unnecessarily. */
+    HAL_Delay(1U);
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_I2C1;
+  PeriphClkInit.I2c1ClockSelection = RCC_I2C1CLKSOURCE_HSI;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x00201D2B;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 38400;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PA5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
