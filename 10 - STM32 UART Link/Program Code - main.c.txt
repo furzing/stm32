@@ -1,0 +1,1522 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+/**
+  * @brief Interrupt-driven state for one raw NMEA receiver.
+  *
+  * The interrupt builds a sentence one byte at a time. When a newline arrives,
+  * it copies the completed sentence into a second buffer for the main loop.
+  * Keeping UART transmission out of the interrupt makes the interrupt short.
+  */
+typedef struct
+{
+  uint8_t received_byte;
+  char building_line[128];
+  char ready_line[128];
+  volatile uint16_t building_length;
+  volatile uint16_t ready_length;
+  volatile uint32_t total_bytes;
+  volatile uint32_t completed_lines;
+  volatile uint32_t dropped_lines;
+  volatile uint32_t overflow_lines;
+  volatile uint32_t uart_errors;
+  volatile uint32_t last_byte_ms;
+  volatile uint8_t collecting;
+  volatile uint8_t line_ready;
+} GPS_Receiver;
+
+/**
+  * @brief Result of checking the integrity of one NMEA sentence.
+  *
+  * A sentence is interpreted only after its XOR checksum is proven valid.
+  * Keeping "malformed" separate from "mismatch" makes diagnostics useful:
+  * malformed means the protocol shape is wrong, while mismatch usually means
+  * one or more bytes were corrupted in transport.
+  */
+typedef enum
+{
+  GPS_CHECKSUM_VALID = 0,
+  GPS_CHECKSUM_MALFORMED,
+  GPS_CHECKSUM_MISMATCH
+} GPS_ChecksumResult;
+
+/**
+  * @brief Application-level navigation state derived from valid NMEA data.
+  *
+  * Coordinates use signed degrees multiplied by 10^7. Fixed-point storage is
+  * deterministic, avoids printf floating-point support, and gives about 1 cm
+  * numerical resolution (well beyond this receiver's physical accuracy).
+  */
+typedef struct
+{
+  int32_t latitude_e7;
+  int32_t longitude_e7;
+  uint32_t last_fix_ms;
+  uint32_t checksum_valid;
+  uint32_t checksum_mismatch;
+  uint32_t malformed_sentences;
+  uint32_t parsed_fixes;
+  uint8_t fix_valid;
+  uint8_t fix_quality;
+  uint8_t satellites_used;
+  char last_source[4];
+} GPS_Navigation;
+
+/**
+  * @brief Interrupt-driven receiver and health counters for the STM32 link.
+  *
+  * USART3 receives one byte per interrupt. The interrupt only assembles a
+  * newline-terminated message; parsing and transmitting happen in main().
+  * That separation keeps interrupt latency short while GPS is also active.
+  */
+typedef struct
+{
+  uint8_t received_byte;
+  char building_line[64];
+  char ready_line[64];
+  volatile uint16_t building_length;
+  volatile uint16_t ready_length;
+  volatile uint32_t total_bytes;
+  volatile uint32_t completed_lines;
+  volatile uint32_t dropped_lines;
+  volatile uint32_t overflow_lines;
+  volatile uint32_t uart_errors;
+  volatile uint8_t line_ready;
+  uint32_t valid_pings;
+  uint32_t malformed_messages;
+  uint32_t wrong_source_messages;
+  uint32_t sequence_discontinuities;
+  uint32_t transmit_errors;
+  uint32_t last_sequence;
+  uint32_t last_ping_ms;
+  uint8_t have_sequence;
+} LINK_Receiver;
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/* GPS stage-09 receiver and parser configuration. */
+#define GPS_NMEA_LINE_SIZE       128U
+#define GPS_MAX_FIELDS            20U
+#define GPS_DEGREES_SCALE   10000000L
+#define GPS_FIX_MAX_AGE_MS       2000U
+#define GPS_STATUS_PERIOD_MS    5000U
+#define GPS_LED_PERIOD_MS        500U
+
+/* Stage-10 point-to-point STM32 link configuration and protocol contract. */
+#define LINK_LINE_SIZE            64U
+#define LINK_LOCAL_NODE_ID          1U
+#define LINK_PEER_NODE_ID           2U
+#define LINK_STATUS_PERIOD_MS    5000U
+#define LINK_STALE_AFTER_MS       3000U
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
+
+/* USER CODE BEGIN PV */
+
+static GPS_Receiver gps_receiver;
+static GPS_Navigation gps_navigation;
+static LINK_Receiver link_receiver;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+/* USER CODE BEGIN PFP */
+static HAL_StatusTypeDef UART_SendString(const char *text);
+static HAL_StatusTypeDef GPS_StartReception(void);
+static uint8_t GPS_TakeCompletedLine(char *destination,
+                                     uint16_t destination_size);
+static int8_t GPS_HexNibble(char character);
+static GPS_ChecksumResult GPS_VerifyChecksum(const char *sentence);
+static uint8_t GPS_SplitFields(char *sentence,
+                               char *fields[],
+                               uint8_t maximum_fields);
+static uint8_t GPS_ParseUnsigned(const char *text,
+                                 uint32_t maximum,
+                                 uint32_t *value);
+static uint8_t GPS_ConvertCoordinate(const char *nmea_coordinate,
+                                     uint8_t degree_digits,
+                                     char hemisphere,
+                                     int32_t *degrees_e7);
+static uint8_t GPS_IsSentenceType(const char *header,
+                                  const char *three_letter_type);
+static uint8_t GPS_ProcessSentence(const char *sentence);
+static void GPS_FormatCoordinate(char *text,
+                                 uint16_t text_size,
+                                 int32_t degrees_e7);
+static void GPS_PrintPosition(void);
+static void GPS_PrintStatus(void);
+static HAL_StatusTypeDef LINK_StartReception(void);
+static uint8_t LINK_TakeCompletedLine(char *destination,
+                                      uint16_t destination_size);
+static void LINK_ProcessLine(const char *line);
+static void LINK_PrintStatus(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+/**
+  * @brief Send a null-terminated text string through the Nucleo's USB serial port.
+  *
+  * USART2 is physically connected to the onboard ST-LINK Virtual COM Port:
+  * PA2 is transmit (TX), and PA3 is receive (RX).
+  */
+static HAL_StatusTypeDef UART_SendString(const char *text)
+{
+  if (text == NULL)
+  {
+    return HAL_ERROR;
+  }
+
+  return HAL_UART_Transmit(&huart2,
+                           (uint8_t *)text,
+                           (uint16_t)strlen(text),
+                           100U);
+}
+
+/**
+  * @brief Clear Node-1 link state and arm interrupt reception on USART3.
+  *
+  * PB11 is USART3_RX and PB10 is USART3_TX. Reception is interrupt-driven so
+  * the main loop can continue parsing GPS data while waiting for Node 2.
+  */
+static HAL_StatusTypeDef LINK_StartReception(void)
+{
+  memset(&link_receiver, 0, sizeof(link_receiver));
+
+  return HAL_UART_Receive_IT(&huart3,
+                             &link_receiver.received_byte,
+                             1U);
+}
+
+/**
+  * @brief Move one complete peer message from interrupt context into main.
+  *
+  * The few instructions inside the critical section make the buffer transfer
+  * atomic: main cannot copy half of an old line and half of a new line.
+  */
+static uint8_t LINK_TakeCompletedLine(char *destination,
+                                      uint16_t destination_size)
+{
+  uint8_t result = 0U;
+
+  if ((destination == NULL) || (destination_size == 0U))
+  {
+    return 0U;
+  }
+
+  uint32_t previous_interrupt_mask = __get_PRIMASK();
+  __disable_irq();
+
+  if (link_receiver.line_ready != 0U)
+  {
+    uint16_t length = link_receiver.ready_length;
+
+    if (length >= destination_size)
+    {
+      length = (uint16_t)(destination_size - 1U);
+    }
+
+    memcpy(destination, link_receiver.ready_line, length);
+    destination[length] = '\0';
+    link_receiver.line_ready = 0U;
+    result = 1U;
+  }
+
+  if (previous_interrupt_mask == 0U)
+  {
+    __enable_irq();
+  }
+
+  return result;
+}
+
+/**
+  * @brief Validate a Node-2 PING and return a matching Node-1 PONG.
+  *
+  * Contract:
+  *   Node 2 -> Node 1: "PING,2,<sequence>\r\n"
+  *   Node 1 -> Node 2: "PONG,1,<same-sequence>\r\n"
+  *
+  * The source ID catches crossed/misconfigured nodes. Echoing the sequence
+  * lets Node 2 measure loss and round-trip time rather than merely seeing data.
+  */
+static void LINK_ProcessLine(const char *line)
+{
+  unsigned long source_node = 0UL;
+  unsigned long sequence = 0UL;
+  int characters_consumed = 0;
+  char response[40];
+  char console_message[96];
+
+  if (line == NULL)
+  {
+    return;
+  }
+
+  if ((sscanf(line,
+              "PING,%lu,%lu%n",
+              &source_node,
+              &sequence,
+              &characters_consumed) != 2) ||
+      (line[characters_consumed] != '\0'))
+  {
+    link_receiver.malformed_messages++;
+    snprintf(console_message,
+             sizeof(console_message),
+             "LINK RX rejected malformed message: %s\r\n",
+             line);
+    UART_SendString(console_message);
+    return;
+  }
+
+  if (source_node != LINK_PEER_NODE_ID)
+  {
+    link_receiver.wrong_source_messages++;
+    snprintf(console_message,
+             sizeof(console_message),
+             "LINK RX rejected unexpected node %lu\r\n",
+             source_node);
+    UART_SendString(console_message);
+    return;
+  }
+
+  if ((link_receiver.have_sequence != 0U) &&
+      ((uint32_t)sequence != (link_receiver.last_sequence + 1U)))
+  {
+    link_receiver.sequence_discontinuities++;
+  }
+
+  link_receiver.have_sequence = 1U;
+  link_receiver.last_sequence = (uint32_t)sequence;
+  link_receiver.last_ping_ms = HAL_GetTick();
+  link_receiver.valid_pings++;
+
+  snprintf(response,
+           sizeof(response),
+           "PONG,%u,%lu\r\n",
+           LINK_LOCAL_NODE_ID,
+           sequence);
+
+  if (HAL_UART_Transmit(&huart3,
+                        (uint8_t *)response,
+                        (uint16_t)strlen(response),
+                        100U) != HAL_OK)
+  {
+    link_receiver.transmit_errors++;
+    UART_SendString("LINK TX error while sending PONG.\r\n");
+    return;
+  }
+
+  snprintf(console_message,
+           sizeof(console_message),
+           "LINK RX: PING node=%lu seq=%lu -> TX: PONG node=%u seq=%lu\r\n",
+           source_node,
+           sequence,
+           LINK_LOCAL_NODE_ID,
+           sequence);
+  UART_SendString(console_message);
+}
+
+/**
+  * @brief Print evidence that the link is alive, stale, or never established.
+  */
+static void LINK_PrintStatus(void)
+{
+  char message[192];
+  const char *state;
+  uint32_t age_ms;
+
+  if (link_receiver.valid_pings == 0U)
+  {
+    state = "WAITING";
+    age_ms = 0U;
+  }
+  else
+  {
+    age_ms = HAL_GetTick() - link_receiver.last_ping_ms;
+    state = (age_ms <= LINK_STALE_AFTER_MS) ? "ONLINE" : "STALE";
+  }
+
+  snprintf(message,
+           sizeof(message),
+           "LINK STATUS: %s pings=%lu last_seq=%lu age=%lu ms lines=%lu dropped=%lu overflow=%lu malformed=%lu wrong_node=%lu seq_gaps=%lu uart_errors=%lu tx_errors=%lu\r\n",
+           state,
+           (unsigned long)link_receiver.valid_pings,
+           (unsigned long)link_receiver.last_sequence,
+           (unsigned long)age_ms,
+           (unsigned long)link_receiver.completed_lines,
+           (unsigned long)link_receiver.dropped_lines,
+           (unsigned long)link_receiver.overflow_lines,
+           (unsigned long)link_receiver.malformed_messages,
+           (unsigned long)link_receiver.wrong_source_messages,
+           (unsigned long)link_receiver.sequence_discontinuities,
+           (unsigned long)link_receiver.uart_errors,
+           (unsigned long)link_receiver.transmit_errors);
+  UART_SendString(message);
+}
+
+/**
+  * @brief Clear the GPS state and arm the first one-byte USART1 reception.
+  *
+  * HAL_UART_Receive_IT() returns immediately. USART1 later interrupts the CPU
+  * after one byte arrives, and HAL calls HAL_UART_RxCpltCallback().
+  */
+static HAL_StatusTypeDef GPS_StartReception(void)
+{
+  memset(&gps_receiver, 0, sizeof(gps_receiver));
+  memset(&gps_navigation, 0, sizeof(gps_navigation));
+
+  return HAL_UART_Receive_IT(&huart1,
+                             &gps_receiver.received_byte,
+                             1U);
+}
+
+/**
+  * @brief Copy one completed NMEA sentence safely from interrupt to main.
+  *
+  * The interrupt could finish another sentence while main is copying. A very
+  * short critical section prevents the shared ready buffer from changing
+  * halfway through the copy. The previous interrupt state is restored so this
+  * function does not accidentally enable interrupts disabled by its caller.
+  */
+static uint8_t GPS_TakeCompletedLine(char *destination,
+                                     uint16_t destination_size)
+{
+  uint8_t result = 0U;
+
+  if ((destination == NULL) || (destination_size == 0U))
+  {
+    return 0U;
+  }
+
+  uint32_t previous_interrupt_mask = __get_PRIMASK();
+  __disable_irq();
+
+  if (gps_receiver.line_ready != 0U)
+  {
+    uint16_t length = gps_receiver.ready_length;
+
+    if (length >= destination_size)
+    {
+      length = (uint16_t)(destination_size - 1U);
+    }
+
+    memcpy(destination, gps_receiver.ready_line, length);
+    destination[length] = '\0';
+    gps_receiver.line_ready = 0U;
+    result = 1U;
+  }
+
+  if (previous_interrupt_mask == 0U)
+  {
+    __enable_irq();
+  }
+
+  return result;
+}
+
+/**
+  * @brief Convert one hexadecimal checksum character into a 0..15 value.
+  * @return Nibble value, or -1 when the character is not hexadecimal.
+  */
+static int8_t GPS_HexNibble(char character)
+{
+  if ((character >= '0') && (character <= '9'))
+  {
+    return (int8_t)(character - '0');
+  }
+
+  if ((character >= 'A') && (character <= 'F'))
+  {
+    return (int8_t)(character - 'A' + 10);
+  }
+
+  if ((character >= 'a') && (character <= 'f'))
+  {
+    return (int8_t)(character - 'a' + 10);
+  }
+
+  return -1;
+}
+
+/**
+  * @brief Verify the NMEA XOR checksum before interpreting any fields.
+  *
+  * NMEA calculates the XOR of every byte after '$' and before '*'. The two
+  * hexadecimal characters after '*' are the checksum transmitted by the GPS.
+  */
+static GPS_ChecksumResult GPS_VerifyChecksum(const char *sentence)
+{
+  if ((sentence == NULL) || (sentence[0] != '$'))
+  {
+    return GPS_CHECKSUM_MALFORMED;
+  }
+
+  const char *asterisk = strchr(sentence, '*');
+
+  if ((asterisk == NULL) ||
+      (asterisk == &sentence[1]) ||
+      (asterisk[1] == '\0') ||
+      (asterisk[2] == '\0') ||
+      (asterisk[3] != '\0'))
+  {
+    return GPS_CHECKSUM_MALFORMED;
+  }
+
+  int8_t high_nibble = GPS_HexNibble(asterisk[1]);
+  int8_t low_nibble = GPS_HexNibble(asterisk[2]);
+
+  if ((high_nibble < 0) || (low_nibble < 0))
+  {
+    return GPS_CHECKSUM_MALFORMED;
+  }
+
+  uint8_t calculated = 0U;
+  for (const char *character = &sentence[1];
+       character < asterisk;
+       character++)
+  {
+    calculated ^= (uint8_t)(*character);
+  }
+
+  uint8_t transmitted = (uint8_t)(((uint8_t)high_nibble << 4) |
+                                   (uint8_t)low_nibble);
+
+  return (calculated == transmitted) ?
+      GPS_CHECKSUM_VALID : GPS_CHECKSUM_MISMATCH;
+}
+
+/**
+  * @brief Split a sentence in place while preserving empty NMEA fields.
+  *
+  * strtok() is intentionally not used because it collapses repeated commas.
+  * In NMEA, an empty field is meaningful; it often means data is unavailable.
+  */
+static uint8_t GPS_SplitFields(char *sentence,
+                               char *fields[],
+                               uint8_t maximum_fields)
+{
+  if ((sentence == NULL) || (fields == NULL) || (maximum_fields == 0U))
+  {
+    return 0U;
+  }
+
+  uint8_t field_count = 1U;
+  fields[0] = sentence;
+
+  for (char *character = sentence; *character != '\0'; character++)
+  {
+    if (*character == ',')
+    {
+      *character = '\0';
+
+      if (field_count >= maximum_fields)
+      {
+        return 0U;
+      }
+
+      fields[field_count++] = character + 1;
+    }
+  }
+
+  return field_count;
+}
+
+/**
+  * @brief Parse a bounded, non-negative decimal integer field.
+  */
+static uint8_t GPS_ParseUnsigned(const char *text,
+                                 uint32_t maximum,
+                                 uint32_t *value)
+{
+  if ((text == NULL) || (text[0] == '\0') || (value == NULL))
+  {
+    return 0U;
+  }
+
+  uint32_t result = 0U;
+
+  for (const char *character = text; *character != '\0'; character++)
+  {
+    if ((*character < '0') || (*character > '9'))
+    {
+      return 0U;
+    }
+
+    uint32_t digit = (uint32_t)(*character - '0');
+    if ((digit > maximum) ||
+        (result > ((maximum - digit) / 10U)))
+    {
+      return 0U;
+    }
+
+    result = (result * 10U) + digit;
+  }
+
+  *value = result;
+  return 1U;
+}
+
+/**
+  * @brief Convert NMEA degrees/minutes text to signed degrees x 10^7.
+  *
+  * Latitude arrives as ddmm.mmmm and longitude as dddmm.mmmm. The minutes
+  * portion is divided by 60, then S/W hemispheres make the result negative.
+  */
+static uint8_t GPS_ConvertCoordinate(const char *nmea_coordinate,
+                                     uint8_t degree_digits,
+                                     char hemisphere,
+                                     int32_t *degrees_e7)
+{
+  if ((nmea_coordinate == NULL) ||
+      (nmea_coordinate[0] == '\0') ||
+      (degrees_e7 == NULL) ||
+      ((degree_digits != 2U) && (degree_digits != 3U)))
+  {
+    return 0U;
+  }
+
+  const char *decimal_point = strchr(nmea_coordinate, '.');
+  size_t integer_digits = (decimal_point == NULL) ?
+      strlen(nmea_coordinate) :
+      (size_t)(decimal_point - nmea_coordinate);
+
+  if (integer_digits != (size_t)(degree_digits + 2U))
+  {
+    return 0U;
+  }
+
+  uint32_t whole_degrees = 0U;
+  for (uint8_t index = 0U; index < degree_digits; index++)
+  {
+    char character = nmea_coordinate[index];
+    if ((character < '0') || (character > '9'))
+    {
+      return 0U;
+    }
+    whole_degrees = (whole_degrees * 10U) +
+                    (uint32_t)(character - '0');
+  }
+
+  char minute_tens = nmea_coordinate[degree_digits];
+  char minute_ones = nmea_coordinate[degree_digits + 1U];
+  if ((minute_tens < '0') || (minute_tens > '9') ||
+      (minute_ones < '0') || (minute_ones > '9'))
+  {
+    return 0U;
+  }
+
+  uint32_t whole_minutes =
+      ((uint32_t)(minute_tens - '0') * 10U) +
+      (uint32_t)(minute_ones - '0');
+  if (whole_minutes >= 60U)
+  {
+    return 0U;
+  }
+
+  uint32_t fractional_minutes = 0U;
+  uint8_t fractional_digits = 0U;
+  uint8_t round_up = 0U;
+
+  if (decimal_point != NULL)
+  {
+    for (const char *character = decimal_point + 1;
+         *character != '\0';
+         character++)
+    {
+      if ((*character < '0') || (*character > '9'))
+      {
+        return 0U;
+      }
+
+      if (fractional_digits < 7U)
+      {
+        fractional_minutes = (fractional_minutes * 10U) +
+                             (uint32_t)(*character - '0');
+      }
+      else if (fractional_digits == 7U)
+      {
+        round_up = (*character >= '5') ? 1U : 0U;
+      }
+
+      fractional_digits++;
+    }
+  }
+
+  uint8_t stored_digits = (fractional_digits > 7U) ?
+      7U : fractional_digits;
+  while (stored_digits < 7U)
+  {
+    fractional_minutes *= 10U;
+    stored_digits++;
+  }
+
+  uint64_t minutes_e7 =
+      ((uint64_t)whole_minutes * (uint64_t)GPS_DEGREES_SCALE) +
+      (uint64_t)fractional_minutes +
+      (uint64_t)round_up;
+
+  uint32_t maximum_degrees = (degree_digits == 2U) ? 90U : 180U;
+  if ((whole_degrees > maximum_degrees) ||
+      ((whole_degrees == maximum_degrees) && (minutes_e7 != 0U)))
+  {
+    return 0U;
+  }
+
+  if (((degree_digits == 2U) &&
+       (hemisphere != 'N') && (hemisphere != 'S')) ||
+      ((degree_digits == 3U) &&
+       (hemisphere != 'E') && (hemisphere != 'W')))
+  {
+    return 0U;
+  }
+
+  uint64_t unsigned_degrees_e7 =
+      ((uint64_t)whole_degrees * (uint64_t)GPS_DEGREES_SCALE) +
+      ((minutes_e7 + 30U) / 60U);
+
+  int32_t signed_degrees_e7 = (int32_t)unsigned_degrees_e7;
+  if ((hemisphere == 'S') || (hemisphere == 'W'))
+  {
+    signed_degrees_e7 = -signed_degrees_e7;
+  }
+
+  *degrees_e7 = signed_degrees_e7;
+  return 1U;
+}
+
+/**
+  * @brief Match GGA/RMC independent of the two-character talker ID.
+  *
+  * For example, both $GPGGA (GPS only) and $GNGGA (multi-GNSS) are accepted.
+  */
+static uint8_t GPS_IsSentenceType(const char *header,
+                                  const char *three_letter_type)
+{
+  if ((header == NULL) || (three_letter_type == NULL))
+  {
+    return 0U;
+  }
+
+  size_t header_length = strlen(header);
+  return ((header_length == 6U) &&
+          (header[0] == '$') &&
+          (strcmp(&header[header_length - 3U], three_letter_type) == 0)) ?
+      1U : 0U;
+}
+
+/**
+  * @brief Validate and interpret one completed NMEA sentence.
+  * @return 1 when a new valid coordinate was stored, otherwise 0.
+  */
+static uint8_t GPS_ProcessSentence(const char *sentence)
+{
+  GPS_ChecksumResult checksum_result = GPS_VerifyChecksum(sentence);
+
+  if (checksum_result == GPS_CHECKSUM_MISMATCH)
+  {
+    gps_navigation.checksum_mismatch++;
+    return 0U;
+  }
+
+  if (checksum_result != GPS_CHECKSUM_VALID)
+  {
+    gps_navigation.malformed_sentences++;
+    return 0U;
+  }
+
+  gps_navigation.checksum_valid++;
+
+  size_t sentence_length = strlen(sentence);
+  if (sentence_length >= GPS_NMEA_LINE_SIZE)
+  {
+    gps_navigation.malformed_sentences++;
+    return 0U;
+  }
+
+  char parse_buffer[GPS_NMEA_LINE_SIZE];
+  memcpy(parse_buffer, sentence, sentence_length + 1U);
+
+  char *asterisk = strchr(parse_buffer, '*');
+  if (asterisk == NULL)
+  {
+    gps_navigation.malformed_sentences++;
+    return 0U;
+  }
+  *asterisk = '\0';
+
+  char *fields[GPS_MAX_FIELDS] = {0};
+  uint8_t field_count = GPS_SplitFields(parse_buffer,
+                                         fields,
+                                         GPS_MAX_FIELDS);
+  if (field_count == 0U)
+  {
+    gps_navigation.malformed_sentences++;
+    return 0U;
+  }
+
+  int32_t latitude_e7;
+  int32_t longitude_e7;
+
+  if (GPS_IsSentenceType(fields[0], "GGA") != 0U)
+  {
+    if (field_count < 8U)
+    {
+      gps_navigation.malformed_sentences++;
+      return 0U;
+    }
+
+    uint32_t fix_quality;
+    uint32_t satellites;
+    if ((GPS_ParseUnsigned(fields[6], 9U, &fix_quality) == 0U) ||
+        (GPS_ParseUnsigned(fields[7], 99U, &satellites) == 0U))
+    {
+      gps_navigation.malformed_sentences++;
+      return 0U;
+    }
+
+    gps_navigation.fix_quality = (uint8_t)fix_quality;
+    gps_navigation.satellites_used = (uint8_t)satellites;
+    memcpy(gps_navigation.last_source, "GGA", 4U);
+
+    if (fix_quality == 0U)
+    {
+      gps_navigation.fix_valid = 0U;
+      return 0U;
+    }
+
+    if ((strlen(fields[3]) != 1U) ||
+        (strlen(fields[5]) != 1U) ||
+        (GPS_ConvertCoordinate(fields[2], 2U, fields[3][0],
+                               &latitude_e7) == 0U) ||
+        (GPS_ConvertCoordinate(fields[4], 3U, fields[5][0],
+                               &longitude_e7) == 0U))
+    {
+      gps_navigation.malformed_sentences++;
+      gps_navigation.fix_valid = 0U;
+      return 0U;
+    }
+  }
+  else if (GPS_IsSentenceType(fields[0], "RMC") != 0U)
+  {
+    if ((field_count < 7U) || (strlen(fields[2]) != 1U))
+    {
+      gps_navigation.malformed_sentences++;
+      return 0U;
+    }
+
+    memcpy(gps_navigation.last_source, "RMC", 4U);
+
+    if (fields[2][0] == 'V')
+    {
+      gps_navigation.fix_valid = 0U;
+      return 0U;
+    }
+
+    if (fields[2][0] != 'A')
+    {
+      gps_navigation.malformed_sentences++;
+      gps_navigation.fix_valid = 0U;
+      return 0U;
+    }
+
+    if ((strlen(fields[4]) != 1U) ||
+        (strlen(fields[6]) != 1U) ||
+        (GPS_ConvertCoordinate(fields[3], 2U, fields[4][0],
+                               &latitude_e7) == 0U) ||
+        (GPS_ConvertCoordinate(fields[5], 3U, fields[6][0],
+                               &longitude_e7) == 0U))
+    {
+      gps_navigation.malformed_sentences++;
+      gps_navigation.fix_valid = 0U;
+      return 0U;
+    }
+  }
+  else
+  {
+    /* Other valid NMEA sentences remain useful for diagnostics but are not
+       required for the first position implementation. */
+    return 0U;
+  }
+
+  gps_navigation.latitude_e7 = latitude_e7;
+  gps_navigation.longitude_e7 = longitude_e7;
+  gps_navigation.last_fix_ms = HAL_GetTick();
+  gps_navigation.fix_valid = 1U;
+  gps_navigation.parsed_fixes++;
+  return 1U;
+}
+
+/**
+  * @brief Format signed degrees x 10^7 without floating-point printf.
+  */
+static void GPS_FormatCoordinate(char *text,
+                                 uint16_t text_size,
+                                 int32_t degrees_e7)
+{
+  if ((text == NULL) || (text_size == 0U))
+  {
+    return;
+  }
+
+  int64_t signed_value = degrees_e7;
+  uint64_t magnitude = (signed_value < 0) ?
+      (uint64_t)(-signed_value) : (uint64_t)signed_value;
+
+  snprintf(text,
+           text_size,
+           "%s%lu.%07lu",
+           (signed_value < 0) ? "-" : "",
+           (unsigned long)(magnitude / GPS_DEGREES_SCALE),
+           (unsigned long)(magnitude % GPS_DEGREES_SCALE));
+}
+
+/**
+  * @brief Print the newest validated position in ordinary decimal degrees.
+  */
+static void GPS_PrintPosition(void)
+{
+  char latitude[20];
+  char longitude[20];
+  char message[176];
+
+  GPS_FormatCoordinate(latitude,
+                       sizeof(latitude),
+                       gps_navigation.latitude_e7);
+  GPS_FormatCoordinate(longitude,
+                       sizeof(longitude),
+                       gps_navigation.longitude_e7);
+
+  snprintf(message,
+           sizeof(message),
+           "GPS FIX: latitude=%s deg longitude=%s deg source=%s quality=%u satellites=%u age=%lu ms\r\n",
+           latitude,
+           longitude,
+           gps_navigation.last_source,
+           gps_navigation.fix_quality,
+           gps_navigation.satellites_used,
+           (unsigned long)(HAL_GetTick() - gps_navigation.last_fix_ms));
+  UART_SendString(message);
+}
+
+/**
+  * @brief Print transport, parser, and navigation health counters.
+  */
+static void GPS_PrintStatus(void)
+{
+  char message[288];
+  uint32_t bytes;
+  uint32_t lines;
+  uint32_t dropped;
+  uint32_t overflows;
+  uint32_t errors;
+  uint32_t last_byte_ms;
+
+  uint32_t previous_interrupt_mask = __get_PRIMASK();
+  __disable_irq();
+  bytes = gps_receiver.total_bytes;
+  lines = gps_receiver.completed_lines;
+  dropped = gps_receiver.dropped_lines;
+  overflows = gps_receiver.overflow_lines;
+  errors = gps_receiver.uart_errors;
+  last_byte_ms = gps_receiver.last_byte_ms;
+  if (previous_interrupt_mask == 0U)
+  {
+    __enable_irq();
+  }
+
+  if (bytes == 0U)
+  {
+    UART_SendString(
+        "GPS STATUS: no UART bytes; check power, GND, and GPS TX -> PA10/D2.\r\n");
+    return;
+  }
+
+  uint32_t fix_age_ms = (gps_navigation.parsed_fixes == 0U) ?
+      0U : (uint32_t)(HAL_GetTick() - gps_navigation.last_fix_ms);
+  const char *fix_state;
+
+  if (gps_navigation.fix_valid == 0U)
+  {
+    fix_state = "NO_FIX";
+  }
+  else if (fix_age_ms > GPS_FIX_MAX_AGE_MS)
+  {
+    fix_state = "STALE";
+  }
+  else
+  {
+    fix_state = "VALID";
+  }
+
+  snprintf(message,
+           sizeof(message),
+           "GPS STATUS: bytes=%lu lines=%lu dropped=%lu overflow=%lu uart_errors=%lu checksum_ok=%lu checksum_bad=%lu malformed=%lu fixes=%lu state=%s sats=%u fix_age=%lu ms last_byte=%lu ms ago\r\n",
+           (unsigned long)bytes,
+           (unsigned long)lines,
+           (unsigned long)dropped,
+           (unsigned long)overflows,
+           (unsigned long)errors,
+           (unsigned long)gps_navigation.checksum_valid,
+           (unsigned long)gps_navigation.checksum_mismatch,
+           (unsigned long)gps_navigation.malformed_sentences,
+           (unsigned long)gps_navigation.parsed_fixes,
+           fix_state,
+           gps_navigation.satellites_used,
+           (unsigned long)fix_age_ms,
+           (unsigned long)(HAL_GetTick() - last_byte_ms));
+  UART_SendString(message);
+}
+
+/**
+  * @brief USART receive-complete callback called by the STM32 HAL.
+  *
+  * NMEA is ASCII text. '$' starts a sentence, carriage return is ignored, and
+  * newline completes it. Bytes before '$' are discarded so startup can begin
+  * in the middle of a GPS transmission and still synchronize automatically.
+  */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart == NULL)
+  {
+    return;
+  }
+
+  if (huart->Instance == USART3)
+  {
+    uint8_t link_byte = link_receiver.received_byte;
+    link_receiver.total_bytes++;
+
+    if (link_byte == (uint8_t)'\n')
+    {
+      if (link_receiver.line_ready == 0U)
+      {
+        uint16_t length = link_receiver.building_length;
+        memcpy(link_receiver.ready_line,
+               link_receiver.building_line,
+               length);
+        link_receiver.ready_line[length] = '\0';
+        link_receiver.ready_length = length;
+        link_receiver.line_ready = 1U;
+        link_receiver.completed_lines++;
+      }
+      else
+      {
+        link_receiver.dropped_lines++;
+      }
+
+      link_receiver.building_length = 0U;
+    }
+    else if (link_byte != (uint8_t)'\r')
+    {
+      if (link_receiver.building_length < (LINK_LINE_SIZE - 1U))
+      {
+        link_receiver.building_line[link_receiver.building_length++] =
+            (char)link_byte;
+      }
+      else
+      {
+        link_receiver.overflow_lines++;
+        link_receiver.building_length = 0U;
+      }
+    }
+
+    if (HAL_UART_Receive_IT(&huart3,
+                            &link_receiver.received_byte,
+                            1U) != HAL_OK)
+    {
+      link_receiver.uart_errors++;
+    }
+    return;
+  }
+
+  if (huart->Instance != USART1)
+  {
+    return;
+  }
+
+  uint8_t byte = gps_receiver.received_byte;
+  gps_receiver.total_bytes++;
+  gps_receiver.last_byte_ms = HAL_GetTick();
+
+  if (byte == (uint8_t)'$')
+  {
+    gps_receiver.building_length = 0U;
+    gps_receiver.collecting = 1U;
+    gps_receiver.building_line[gps_receiver.building_length++] = '$';
+  }
+  else if (gps_receiver.collecting != 0U)
+  {
+    if (byte == (uint8_t)'\n')
+    {
+      if (gps_receiver.line_ready == 0U)
+      {
+        uint16_t length = gps_receiver.building_length;
+        memcpy(gps_receiver.ready_line,
+               gps_receiver.building_line,
+               length);
+        gps_receiver.ready_line[length] = '\0';
+        gps_receiver.ready_length = length;
+        gps_receiver.line_ready = 1U;
+        gps_receiver.completed_lines++;
+      }
+      else
+      {
+        /*
+         * Main has not consumed the previous sentence. Preserve the older
+         * complete sentence and count this one instead of overwriting data.
+         */
+        gps_receiver.dropped_lines++;
+      }
+
+      gps_receiver.building_length = 0U;
+      gps_receiver.collecting = 0U;
+    }
+    else if (byte != (uint8_t)'\r')
+    {
+      if (gps_receiver.building_length < (GPS_NMEA_LINE_SIZE - 1U))
+      {
+        gps_receiver.building_line[gps_receiver.building_length++] =
+            (char)byte;
+      }
+      else
+      {
+        gps_receiver.overflow_lines++;
+        gps_receiver.building_length = 0U;
+        gps_receiver.collecting = 0U;
+      }
+    }
+  }
+
+  if (HAL_UART_Receive_IT(&huart1,
+                          &gps_receiver.received_byte,
+                          1U) != HAL_OK)
+  {
+    gps_receiver.uart_errors++;
+  }
+}
+
+/**
+  * @brief Recover reception after framing, noise, or overrun errors.
+  */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart == NULL)
+  {
+    return;
+  }
+
+  if (huart->Instance == USART3)
+  {
+    link_receiver.uart_errors++;
+    link_receiver.building_length = 0U;
+
+    if (HAL_UART_Receive_IT(&huart3,
+                            &link_receiver.received_byte,
+                            1U) != HAL_OK)
+    {
+      link_receiver.uart_errors++;
+    }
+    return;
+  }
+
+  if (huart->Instance != USART1)
+  {
+    return;
+  }
+
+  gps_receiver.uart_errors++;
+  gps_receiver.building_length = 0U;
+  gps_receiver.collecting = 0U;
+
+  if (HAL_UART_Receive_IT(&huart1,
+                          &gps_receiver.received_byte,
+                          1U) != HAL_OK)
+  {
+    gps_receiver.uart_errors++;
+  }
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_USART1_UART_Init();
+  MX_USART3_UART_Init();
+  /* USER CODE BEGIN 2 */
+  UART_SendString("\r\n========================================\r\n");
+  UART_SendString("10 - Two STM32 UART link with GPS retained\r\n");
+  UART_SendString("GPS USART1: PA10/RX, PA9/TX, 9600 baud, 8-N-1\r\n");
+  UART_SendString("Console USART2: ST-LINK VCP, 38400 baud, 8-N-1\r\n");
+  UART_SendString("Node link USART3: PB11/RX, PB10/TX, 115200 baud, 8-N-1\r\n");
+  UART_SendString("Protocol: receive PING,2,<seq>; reply PONG,1,<seq>\r\n");
+  UART_SendString("LD2 heartbeat: toggles every 500 ms\r\n");
+  UART_SendString("Coordinates: checksum-verified signed decimal degrees\r\n");
+
+  if (GPS_StartReception() == HAL_OK)
+  {
+    UART_SendString(
+        "USART1 reception armed; waiting for valid GGA/RMC fixes.\r\n");
+  }
+  else
+  {
+    UART_SendString(
+        "ERROR: USART1 reception could not be started.\r\n");
+  }
+
+  if (LINK_StartReception() == HAL_OK)
+  {
+    UART_SendString(
+        "USART3 reception armed; waiting for PING messages from Node 2.\r\n");
+  }
+  else
+  {
+    UART_SendString(
+        "ERROR: USART3 node-link reception could not be started.\r\n");
+  }
+  UART_SendString("========================================\r\n");
+
+  char gps_line[GPS_NMEA_LINE_SIZE] = {0};
+  char link_line[LINK_LINE_SIZE] = {0};
+  uint32_t last_led_toggle = HAL_GetTick();
+  uint32_t last_gps_status = HAL_GetTick();
+  uint32_t last_link_status = HAL_GetTick();
+
+  
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    uint32_t now = HAL_GetTick();
+
+    if ((uint32_t)(now - last_led_toggle) >= GPS_LED_PERIOD_MS)
+    {
+      HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+      last_led_toggle = now;
+    }
+
+    if (GPS_TakeCompletedLine(gps_line, sizeof(gps_line)) != 0U)
+    {
+      if (GPS_ProcessSentence(gps_line) != 0U)
+      {
+        GPS_PrintPosition();
+      }
+    }
+
+    if (LINK_TakeCompletedLine(link_line, sizeof(link_line)) != 0U)
+    {
+      LINK_ProcessLine(link_line);
+    }
+
+    if ((uint32_t)(now - last_gps_status) >= GPS_STATUS_PERIOD_MS)
+    {
+      GPS_PrintStatus();
+      last_gps_status = now;
+    }
+
+    if ((uint32_t)(now - last_link_status) >= LINK_STATUS_PERIOD_MS)
+    {
+      LINK_PrintStatus();
+      last_link_status = now;
+    }
+
+    HAL_Delay(1U);
+  }
+  
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1;
+  PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK1;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 9600;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 38400;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PA5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB8 PB9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

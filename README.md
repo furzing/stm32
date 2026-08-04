@@ -16,6 +16,7 @@ what the program does.
 | 07 | Magnetometer Calibration | Learns hard-iron offsets and per-axis soft-iron scales from a guided 3D rotation. |
 | 08 | GPS NMEA Reception | Receives complete raw NMEA sentences from the NEO-6M using interrupt-driven USART1. |
 | 09 | GPS Position Parsing | Verifies NMEA checksums and converts valid GGA/RMC latitude and longitude to signed decimal degrees. |
+| 10 | STM32 UART Link | Adds an interrupt-driven USART3 PING/PONG link between Node 1 and Node 2 while retaining GPS and console UARTs. |
 
 Saving was requested after stage 04 was completed, so **04 - Gyroscope
 Calibration** is the first exact saved project. Stages 01 through 03 are
